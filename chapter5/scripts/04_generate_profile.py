@@ -1,7 +1,14 @@
 import re
+import sys
+from pathlib import Path
 
 from jinja2 import Template
 from loguru import logger
+
+
+# src 下のファイルを読み込むために、sys.path にパスを追加
+root_dir = Path(__file__).resolve().parents[1]
+sys.path.append(str(root_dir))
 
 from src.llms.apis import openai
 from src.llms.models import LLMResponse

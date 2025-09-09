@@ -1,6 +1,13 @@
 import io
+import sys
+from pathlib import Path
 
 from loguru import logger
+
+
+# src 下のファイルを読み込むために、sys.path にパスを追加
+root_dir = Path(__file__).resolve().parents[1]
+sys.path.append(str(root_dir))
 
 from src.modules import describe_dataframe, generate_code
 

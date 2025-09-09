@@ -1,7 +1,14 @@
 import io
+import sys
+from pathlib import Path
 
 import pandas as pd
 from loguru import logger
+
+
+# src 下のファイルを読み込むために、sys.path にパスを追加
+root_dir = Path(__file__).resolve().parents[1]
+sys.path.append(str(root_dir))
 
 from src.llms.utils import load_template
 
