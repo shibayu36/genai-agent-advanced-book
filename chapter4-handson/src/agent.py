@@ -69,10 +69,29 @@ def create_graph():
 
     return app
 
+# === グラフの可視化 ===
+def visualize_graph(app):
+    """グラフを可視化する
+    
+    Args:
+        app: LangGraphのアプリケーション
+    """
+    graph = app.get_graph()
+    
+    print("=" * 50)
+    print("【Graph構造】")
+    print("=" * 50)
+    print(graph.draw_ascii())
+    print("=" * 50)
+    print()
+
 # === 実行 ===
 if __name__ == "__main__":
     # グラフを作成
     app = create_graph()
+    
+    # グラフを可視化
+    visualize_graph(app)
 
     # 初期状態を渡して実行
     result = app.invoke({
