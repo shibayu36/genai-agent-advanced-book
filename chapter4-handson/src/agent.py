@@ -77,7 +77,7 @@ def visualize_graph(app):
         app: LangGraphのアプリケーション
     """
     graph = app.get_graph()
-    
+
     print("=" * 50)
     print("【Graph構造】")
     print("=" * 50)
@@ -89,7 +89,7 @@ def visualize_graph(app):
 if __name__ == "__main__":
     # グラフを作成
     app = create_graph()
-    
+
     # グラフを可視化
     visualize_graph(app)
 
