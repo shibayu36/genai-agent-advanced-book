@@ -4,12 +4,20 @@ Step 1: 最小エージェント
 - StateGraph, ノード, エッジの使い方を学ぶ
 """
 
+import json
 from typing import TypedDict
 
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.graph import END, START, StateGraph
 from openai import OpenAI
 
 from src.configs import Settings
+from src.tools.search_xyz_manual import search_xyz_manual
+from src.tools.search_xyz_qa import search_xyz_qa
+
+# === ツールリスト ===
+TOOLS = [search_xyz_manual, search_xyz_qa]
+TOOL_MAP = {tool.name: tool for tool in TOOLS}
 
 
 # === 状態の定義 ===
@@ -17,10 +25,71 @@ from src.configs import Settings
 class AgentState(TypedDict):
     question: str  # ユーザーからの質問
     answer: str  # エージェントの回答
+    tool_calls: list  # 選択されたツール呼び出し
+    tool_results: list  # ツール実行結果
 
 
 # === ノードの定義 ===
 # ノードは「状態を受け取り、更新された状態を返す関数」
+
+
+def select_tools(state: AgentState) -> dict:
+    """LLMにツールを選択させるノード"""
+
+    print("[Node] select_tools")
+
+    settings = Settings()
+    client = OpenAI(api_key=settings.openai_api_key)
+
+    # LangChainツールをOpenAI形式に変換
+    openai_tools = [convert_to_openai_tool(tool) for tool in TOOLS]
+
+    messages = [
+        {
+            "role": "system",
+            "content": "あなたはXYZシステムのヘルプデスク担当です。質問に答えるために必要なツールを選択してください。",
+        },
+        {"role": "user", "content": state["question"]},
+    ]
+
+    response = client.chat.completions.create(
+        model=settings.openai_model,
+        messages=messages,
+        tools=openai_tools,
+        temperature=0,
+    )
+
+    tool_calls = response.choices[0].message.tool_calls
+
+    if tool_calls is None:
+        return {"tool_calls": []}
+
+    # tool_callsをシリアライズ可能な形式に変換
+    return {
+        "tool_calls": [
+            {"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments} for tc in tool_calls
+        ]
+    }
+
+
+def execute_tools(state: AgentState) -> dict:
+    """選択されたツールを実行するノード"""
+
+    print("[Node] execute_tools")
+
+    results = []
+
+    for tool_call in state["tool_calls"]:
+        tool_name = tool_call["name"]
+        tool_args = tool_call["arguments"]
+
+        # ツールを実行
+        tool_fn = TOOL_MAP[tool_name]
+        result = tool_fn.invoke(tool_args)
+
+        results.append({"tool": tool_name, "result": result})
+
+    return {"tool_results": results}
 
 
 def create_answer(state: AgentState) -> dict:
@@ -30,8 +99,21 @@ def create_answer(state: AgentState) -> dict:
     client = OpenAI(api_key=settings.openai_api_key)
 
     messages = [
-        {"role": "system", "content": "あなたはXYZシステムのヘルプデスク担当です。質問に簡潔に回答してください。"},
-        {"role": "user", "content": state["question"]},
+        {
+            "role": "system",
+            "content": """あなたはXYZシステムのヘルプデスク担当です。
+検索結果を参考にして、質問に正確に回答してください。
+検索結果に情報がない場合は、その旨を伝えてください。""",
+        },
+        {
+            "role": "user",
+            "content": f"""質問: {state["question"]}
+
+検索結果:
+{json.dumps(state["tool_results"], ensure_ascii=False, indent=2)}
+
+上記の検索結果を参考に回答してください。""",
+        },
     ]
 
     response = client.chat.completions.create(
@@ -54,11 +136,15 @@ def create_graph():
     workflow = StateGraph(AgentState)
 
     # ノードを追加
+    workflow.add_node("select_tools", select_tools)
+    workflow.add_node("execute_tools", execute_tools)
     workflow.add_node("create_answer", create_answer)
 
-    # エッジを追加
-    workflow.add_edge(START, "create_answer")
-    workflow.add_edge("create_answer", END)  # create_answer → 終了
+    # エッジを追加（直列に接続）
+    workflow.add_edge(START, "select_tools")
+    workflow.add_edge("select_tools", "execute_tools")
+    workflow.add_edge("execute_tools", "create_answer")
+    workflow.add_edge("create_answer", END)
 
     # グラフをコンパイル
     app = workflow.compile()
@@ -125,6 +211,13 @@ if __name__ == "__main__":
         print("=" * 50)
         print("【質問】")
         print(result["question"])
+        print()
+        print("【使用したツールと実行結果】")
+        for i, tc in enumerate(result["tool_calls"]):
+            print(f"  - {tc['name']}({tc['arguments']})")
+            if i < len(result["tool_results"]):
+                tr = result["tool_results"][i]
+                print(f"    結果: {json.dumps(tr['result'], ensure_ascii=False, indent=6)}")
         print()
         print("【回答】")
         print(result["answer"])
