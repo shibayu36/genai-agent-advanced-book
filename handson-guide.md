@@ -125,19 +125,21 @@ chapter4-handson/
    - 「この機能のデメリットは？」
    - 「なぜこの方式を選んだ？」
 
-### 6. 段階的に追加する機能の順序（パターンB）
+### 6. 段階的に追加する機能の順序
 
 **「動くものから育てる」アプローチ**
 
 1. **最小エージェント**: 質問→回答だけ
 2. **Tool Calling追加**: RAGで検索できるように
-3. **Plan追加**: 質問を分解できるように
-4. **状態管理改善**: Annotated + operator.add
-5. **Reflection追加**: 自己評価とリトライ
-6. **並列実行**: パフォーマンス向上
-7. **サブグラフ化**: コード整理
+3. **Plan追加**: 質問を分解（最初から適切な設計：Subtaskモデル、Annotated、サブグラフ化）
+4. **Reflection追加**: 自己評価とリトライ
+5. **並列実行（Send）**: パフォーマンス向上
 
-**ポイント**: 常に「動くもの」がある状態を維持
+**重要な原則**:
+- **リファクタはStepにしない**: 「状態管理改善」「サブグラフ化」などのリファクタ的な変更を独立したStepにしない
+- **機能追加単位でStepを分ける**: 各Stepは明確な「機能追加」という目的を持つ
+- **最初から適切な設計で書く**: 書き直しが発生すると学習の流れが途切れる。後で必要になる設計（Annotated、サブグラフなど）は最初から取り入れる
+- **常に「動くもの」がある状態を維持**: 各Stepで実行して結果を確認できる
 
 ### 7. コード提示のコツ
 
@@ -191,8 +193,6 @@ chapter4-handson/
 **handson.md内のStep構成**:
 - Step 1: 最小エージェント（LangGraph基本）
 - Step 2: Tool Calling追加
-- Step 3: Plan追加（Structured Output、ループ）
-- Step 4: サブタスク分割改善（Annotated + operator.add）
-- Step 5: Reflection追加
-- Step 6: 並列実行（Send）
-- Step 7: サブグラフ化
+- Step 3: Plan追加（Structured Output、ループ、Subtaskモデル、Annotated、サブグラフ化）
+- Step 4: Reflection追加（自己評価とリトライ）
+- Step 5: 並列実行（Send）
