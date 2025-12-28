@@ -850,6 +850,14 @@ CREATE_LAST_ANSWER_USER_PROMPT = """
 
 #### 3. `src/agent.py` を更新
 
+Step 2から大幅に構造が変わります。主な変更点：
+
+1. **新しいインポート**: `operator`, `Annotated`, `Sequence`, `Pregel`, `ChatCompletionMessageParam` など
+2. **状態の拡張**: `AgentState` に `plan`, `current_step`, `subtask_results` を追加
+3. **サブグラフの導入**: `SubGraphState` と `create_subgraph()` を新規追加
+4. **新しいノード**: `create_plan`, `execute_subtasks`, `should_continue` を追加
+5. **条件分岐**: `add_conditional_edges` でサブタスクをループ実行
+
 ```python
 """
 Step 3: Plan追加
@@ -1309,27 +1317,16 @@ LLMに「自分の回答が十分か」を評価させ、不十分なら別の�
 
 ### 実装
 
+Step 3からの変更点を中心に説明します。
+
 #### 1. `src/models.py` を更新
 
+**変更点:**
+- `ReflectionResult` クラスを追加（自己評価の結果を表現）
+- `Subtask` クラスに `is_completed`, `challenge_count` フィールドを追加
+
 ```python
-from pydantic import BaseModel, Field
-
-
-class Plan(BaseModel):
-    """計画を表すモデル"""
-    subtasks: list[str] = Field(
-        ...,
-        description="質問に回答するために必要なサブタスクのリスト"
-    )
-
-
-class ToolResult(BaseModel):
-    """ツール実行結果"""
-    tool_name: str = Field(..., description="ツールの名前")
-    args: str = Field(..., description="ツールの引数")
-    results: list[dict] = Field(..., description="ツールの結果")
-
-
+# === 追加 ===
 class ReflectionResult(BaseModel):
     """リフレクション（自己評価）の結果"""
     advice: str = Field(
@@ -1342,48 +1339,22 @@ class ReflectionResult(BaseModel):
     )
 
 
+# === 変更: Subtaskクラスにフィールド追加 ===
 class Subtask(BaseModel):
     """サブタスクの実行結果"""
     task_name: str = Field(..., description="サブタスクの名前")
     tool_results: list[ToolResult] = Field(..., description="ツール実行結果")
     subtask_answer: str = Field(..., description="サブタスクの回答")
-    is_completed: bool = Field(default=True, description="完了フラグ")
-    challenge_count: int = Field(default=1, description="試行回数")
+    is_completed: bool = Field(default=True, description="完了フラグ")      # 追加
+    challenge_count: int = Field(default=1, description="試行回数")         # 追加
 ```
 
 #### 2. `src/prompts.py` を更新
 
+**変更点:** 2つのプロンプトを追加
+
 ```python
-PLANNER_SYSTEM_PROMPT = """
-# 役割
-あなたはXYZというシステムのヘルプデスク担当者です。
-ユーザーの質問に答えるために以下の指示に従って回答作成の計画を立ててください。
-
-# 絶対に守るべき制約事項
-- サブタスクはどんな内容について知りたいのかを具体的かつ詳細に記述すること
-- サブタスクは同じ内容を調査しないように重複なく構成すること
-- 必要最小限のサブタスクを作成すること
-
-# 例
-質問: AとBの違いについて教えて
-計画:
-- Aとは何かについて調べる
-- Bとは何かについて調べる
-
-"""
-
-PLANNER_USER_PROMPT = """
-{question}
-"""
-
-SUBTASK_SYSTEM_PROMPT = """
-あなたはXYZというシステムの質問応答のためにサブタスク実行を担当するエージェントです。
-サブタスクはユーザーの質問に回答するために考えられた計画の一つです。
-
-ツールの実行結果から得られた回答に必要なことは言語化してください。
-回答できなかった場合は、その旨を言語化してください。
-"""
-
+# === 追加 ===
 SUBTASK_REFLECTION_USER_PROMPT = """
 ツールの実行結果と回答から、サブタスクに対して正しく回答できているかを評価してください。
 
@@ -1395,100 +1366,41 @@ SUBTASK_RETRY_USER_PROMPT = """
 前回の評価結果に従って、別のアプローチでツールを選択・実行してください。
 過去に試したキーワードとは異なるキーワードで検索してください。
 """
-
-CREATE_LAST_ANSWER_SYSTEM_PROMPT = """
-あなたはXYZというシステムのヘルプデスク回答作成担当です。
-サブタスクの結果をもとに回答を作成してください。
-
-- 回答は質問者の意図を汲み取り、丁寧に作成してください
-- 回答は簡潔で明確にすることを心がけてください
-- 不確定な情報や推測を含めないでください
-- 調べた結果から回答がわからなかった場合は、その旨を素直に回答に含めてください
-"""
-
-CREATE_LAST_ANSWER_USER_PROMPT = """
-ユーザーの質問: {question}
-
-サブタスクの結果:
-{subtask_results}
-
-回答を作成してください
-"""
 ```
 
 #### 3. `src/agent.py` を更新
 
+**主な変更点:**
+1. **インポート追加**: `ReflectionResult`, `SUBTASK_REFLECTION_USER_PROMPT`, `SUBTASK_RETRY_USER_PROMPT`
+2. **定数追加**: `MAX_CHALLENGE_COUNT = 3`
+3. **SubGraphState拡張**: `is_completed`, `challenge_count` を追加
+4. **select_tools変更**: リトライ時は過去の対話履歴を使用
+5. **create_subtask_answer変更**: messagesにassistantメッセージを追加
+6. **新規関数追加**: `reflect_subtask`, `should_continue_subgraph`
+7. **サブグラフ変更**: `reflect_subtask`ノードと条件分岐を追加
+
 ```python
-"""
-Step 4: Reflection追加
-- 自己評価パターン
-- 条件分岐とリトライ
-"""
-
-import json
-import operator
-from typing import Annotated, Literal, Sequence, TypedDict
-
-from langchain_core.utils.function_calling import convert_to_openai_tool
-from langgraph.graph import END, START, StateGraph
-from langgraph.pregel import Pregel
-from openai import OpenAI
-from openai.types.chat import ChatCompletionMessageParam
-
-from src.configs import Settings
-from src.models import Plan, ReflectionResult, Subtask, ToolResult
-from src.prompts import (
-    CREATE_LAST_ANSWER_SYSTEM_PROMPT,
-    CREATE_LAST_ANSWER_USER_PROMPT,
-    PLANNER_SYSTEM_PROMPT,
-    PLANNER_USER_PROMPT,
-    SUBTASK_SYSTEM_PROMPT,
-    SUBTASK_REFLECTION_USER_PROMPT,
-    SUBTASK_RETRY_USER_PROMPT,
-)
-from src.tools.search_xyz_manual import search_xyz_manual
-from src.tools.search_xyz_qa import search_xyz_qa
-
-
+# === 定数追加 ===
 MAX_CHALLENGE_COUNT = 3
 
-# === ツールの準備 ===
-TOOLS = [search_xyz_manual, search_xyz_qa]
-TOOL_MAP = {tool.name: tool for tool in TOOLS}
 
-
-# === 状態の定義 ===
-class AgentState(TypedDict):
-    """メイングラフの状態"""
-    question: str
-    plan: list[str]
-    current_step: int
-    subtask_results: Annotated[Sequence[Subtask], operator.add]
-    answer: str
-
-
+# === SubGraphState: フィールド追加 ===
 class SubGraphState(TypedDict):
     """サブグラフの状態"""
     question: str
     plan: list[str]
     subtask: str
-    is_completed: bool
+    is_completed: bool              # 追加
     messages: list[ChatCompletionMessageParam]
-    challenge_count: int
+    challenge_count: int            # 追加
     tool_results: Annotated[Sequence[ToolResult], operator.add]
     subtask_answer: str
 
 
-# ==========================================
-# サブグラフのノード定義
-# ==========================================
-
+# === select_tools: リトライ対応 ===
 def select_tools(state: SubGraphState) -> dict:
     """ツールを選択するノード"""
-
-    settings = Settings()
-    client = OpenAI(api_key=settings.openai_api_key)
-    openai_tools = [convert_to_openai_tool(tool) for tool in TOOLS]
+    # ...省略...
 
     # 初回かリトライかでプロンプトを切り替え
     if state["challenge_count"] == 0:
@@ -1502,80 +1414,21 @@ def select_tools(state: SubGraphState) -> dict:
         messages = list(state["messages"])
         messages.append({"role": "user", "content": SUBTASK_RETRY_USER_PROMPT})
 
-    response = client.chat.completions.create(
-        model=settings.openai_model,
-        messages=messages,
-        tools=openai_tools,
-        temperature=0,
-    )
-
-    if response.choices[0].message.tool_calls:
-        ai_message: ChatCompletionMessageParam = {
-            "role": "assistant",
-            "tool_calls": [tc.model_dump() for tc in response.choices[0].message.tool_calls],
-        }
-        messages.append(ai_message)
-
-    return {"messages": messages}
+    # ...以下同様...
 
 
-def execute_tools(state: SubGraphState) -> dict:
-    """ツールを実行するノード"""
-
-    messages = list(state["messages"])
-    last_message = messages[-1]
-
-    tool_calls = last_message.get("tool_calls", [])
-    if not tool_calls:
-        return {"messages": messages, "tool_results": []}
-
-    tool_results = []
-
-    for tc in tool_calls:
-        tool_name = tc["function"]["name"]
-        tool_args = tc["function"]["arguments"]
-
-        print(f"    [Tool] {tool_name}: {tool_args}")
-
-        tool_fn = TOOL_MAP[tool_name]
-        result = tool_fn.invoke(tool_args)
-
-        tool_results.append(ToolResult(
-            tool_name=tool_name,
-            args=tool_args,
-            results=result
-        ))
-
-        tool_message: ChatCompletionMessageParam = {
-            "role": "tool",
-            "content": json.dumps(result, ensure_ascii=False),
-            "tool_call_id": tc["id"]
-        }
-        messages.append(tool_message)
-
-    return {"messages": messages, "tool_results": tool_results}
-
-
+# === create_subtask_answer: messagesにassistant追加 ===
 def create_subtask_answer(state: SubGraphState) -> dict:
     """サブタスク回答を作成するノード"""
-
-    settings = Settings()
-    client = OpenAI(api_key=settings.openai_api_key)
-
-    response = client.chat.completions.create(
-        model=settings.openai_model,
-        messages=state["messages"],
-        temperature=0,
-    )
-
-    subtask_answer = response.choices[0].message.content or ""
+    # ...省略...
 
     messages = list(state["messages"])
-    messages.append({"role": "assistant", "content": subtask_answer})
+    messages.append({"role": "assistant", "content": subtask_answer})  # 追加
 
     return {"messages": messages, "subtask_answer": subtask_answer}
 
 
+# === 新規追加: reflect_subtask ===
 def reflect_subtask(state: SubGraphState) -> dict:
     """サブタスク回答を内省するノード"""
 
@@ -1619,6 +1472,7 @@ def reflect_subtask(state: SubGraphState) -> dict:
     return update
 
 
+# === 新規追加: should_continue_subgraph ===
 def should_continue_subgraph(state: SubGraphState) -> Literal["end", "continue"]:
     """サブグラフの継続判定"""
     if state["is_completed"] or state["challenge_count"] >= MAX_CHALLENGE_COUNT:
@@ -1627,6 +1481,7 @@ def should_continue_subgraph(state: SubGraphState) -> Literal["end", "continue"]
         return "continue"
 
 
+# === create_subgraph: reflect_subtaskノードと条件分岐を追加 ===
 def create_subgraph() -> Pregel:
     """サブグラフを作成する"""
     workflow = StateGraph(SubGraphState)
@@ -1634,14 +1489,14 @@ def create_subgraph() -> Pregel:
     workflow.add_node("select_tools", select_tools)
     workflow.add_node("execute_tools", execute_tools)
     workflow.add_node("create_subtask_answer", create_subtask_answer)
-    workflow.add_node("reflect_subtask", reflect_subtask)
+    workflow.add_node("reflect_subtask", reflect_subtask)  # 追加
 
     workflow.add_edge(START, "select_tools")
     workflow.add_edge("select_tools", "execute_tools")
     workflow.add_edge("execute_tools", "create_subtask_answer")
-    workflow.add_edge("create_subtask_answer", "reflect_subtask")
+    workflow.add_edge("create_subtask_answer", "reflect_subtask")  # 変更
 
-    # Reflectionの結果でループするか終了するか決定
+    # 追加: Reflectionの結果でループするか終了するか決定
     workflow.add_conditional_edges(
         "reflect_subtask",
         should_continue_subgraph,
@@ -1651,53 +1506,17 @@ def create_subgraph() -> Pregel:
     return workflow.compile()
 
 
-# ==========================================
-# メイングラフのノード定義
-# ==========================================
-
-def create_plan(state: AgentState) -> dict:
-    """計画を作成するノード"""
-
-    print("[Node] create_plan")
-
-    settings = Settings()
-    client = OpenAI(api_key=settings.openai_api_key)
-
-    messages = [
-        {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
-        {"role": "user", "content": PLANNER_USER_PROMPT.format(question=state["question"])},
-    ]
-
-    response = client.beta.chat.completions.parse(
-        model=settings.openai_model,
-        messages=messages,
-        response_format=Plan,
-        temperature=0,
-    )
-
-    plan = response.choices[0].message.parsed
-    if plan is None:
-        raise ValueError("Plan is None")
-
-    print(f"  計画: {plan.subtasks}")
-
-    return {"plan": plan.subtasks, "current_step": 0}
-
-
+# === execute_subtasks: サブグラフ呼び出し時の初期状態を変更 ===
 def execute_subtasks(state: AgentState) -> dict:
     """サブグラフを実行するノード"""
-
-    subtask = state["plan"][state["current_step"]]
-    print(f"[Node] execute_subtask ({state['current_step'] + 1}/{len(state['plan'])}): {subtask}")
-
-    subgraph = create_subgraph()
+    # ...省略...
 
     result = subgraph.invoke({
         "question": state["question"],
         "plan": state["plan"],
         "subtask": subtask,
-        "is_completed": False,
-        "challenge_count": 0,
+        "is_completed": False,      # 追加
+        "challenge_count": 0,       # 追加
         "messages": [],
         "tool_results": [],
         "subtask_answer": "",
@@ -1707,108 +1526,21 @@ def execute_subtasks(state: AgentState) -> dict:
         task_name=subtask,
         tool_results=list(result["tool_results"]),
         subtask_answer=result["subtask_answer"],
-        is_completed=result["is_completed"],
-        challenge_count=result["challenge_count"],
+        is_completed=result["is_completed"],        # 追加
+        challenge_count=result["challenge_count"],  # 追加
     )
 
     return {"subtask_results": [subtask_result], "current_step": state["current_step"] + 1}
+```
 
+**実行部分の出力変更:**
 
-def should_continue(state: AgentState) -> Literal["continue", "finish"]:
-    """全てのサブタスクが完了したかチェック"""
-    if state["current_step"] < len(state["plan"]):
-        return "continue"
-    else:
-        return "finish"
-
-
-def create_answer(state: AgentState) -> dict:
-    """最終回答を作成するノード"""
-
-    print("[Node] create_answer")
-
-    settings = Settings()
-    client = OpenAI(api_key=settings.openai_api_key)
-
-    subtask_results_str = "\n\n".join([
-        f"【{r.task_name}】\n{r.subtask_answer}"
-        for r in state["subtask_results"]
-    ])
-
-    messages = [
-        {"role": "system", "content": CREATE_LAST_ANSWER_SYSTEM_PROMPT},
-        {"role": "user", "content": CREATE_LAST_ANSWER_USER_PROMPT.format(
-            question=state["question"],
-            subtask_results=subtask_results_str,
-        )},
-    ]
-
-    response = client.chat.completions.create(
-        model=settings.openai_model,
-        messages=messages,
-        temperature=0,
-    )
-
-    return {"answer": response.choices[0].message.content}
-
-
-# === グラフの構築 ===
-def create_graph() -> Pregel:
-    """メイングラフを作成する"""
-    workflow = StateGraph(AgentState)
-
-    workflow.add_node("create_plan", create_plan)
-    workflow.add_node("execute_subtasks", execute_subtasks)
-    workflow.add_node("create_answer", create_answer)
-
-    workflow.add_edge(START, "create_plan")
-    workflow.add_edge("create_plan", "execute_subtasks")
-
-    workflow.add_conditional_edges(
-        "execute_subtasks",
-        should_continue,
-        {
-            "continue": "execute_subtasks",
-            "finish": "create_answer"
-        }
-    )
-
-    workflow.add_edge("create_answer", END)
-
-    return workflow.compile()
-
-
-# === 実行 ===
-if __name__ == "__main__":
-    app = create_graph()
-
-    question = """お世話になっております。
-以下の点についてご教示いただければと存じます。
-
-1. 特定のプロジェクトに対してのみ通知を制限する方法について
-
-2. パスワードに利用可能な文字の制限について
-
-よろしくお願いいたします。"""
-
-    result = app.invoke({"question": question})
-
-    print()
-    print("=" * 50)
-    print("【質問】")
-    print(result["question"])
-    print()
-    print("【計画】")
-    for i, task in enumerate(result["plan"], 1):
-        print(f"  {i}. {task}")
-    print()
-    print("【サブタスク結果】")
-    for r in result["subtask_results"]:
-        status = "✓" if r.is_completed else "✗"
-        print(f"  {status} {r.task_name} (試行: {r.challenge_count}回)")
-    print()
-    print("【最終回答】")
-    print(result["answer"])
+```python
+# === 実行部分: 出力フォーマット変更 ===
+print("【サブタスク結果】")
+for r in result["subtask_results"]:
+    status = "✓" if r.is_completed else "✗"
+    print(f"  {status} {r.task_name} (試行: {r.challenge_count}回)")
 ```
 
 ---
@@ -1929,271 +1661,33 @@ Send("execute_subtasks", {"subtask": "タスク1", ...})
 
 ### 実装
 
+Step 4からの変更点を中心に説明します。
+**サブグラフ部分はStep 4と同じなので変更不要です。**
+
 #### `src/agent.py` を更新
 
+**主な変更点:**
+1. **インポート追加**: `from langgraph.constants import Send`
+2. **create_plan変更**: `current_step: 0` を返さない
+3. **新規関数追加**: `route_subtasks`（Sendによる並列実行）
+4. **execute_subtasks変更**: `current_step` 更新を削除
+5. **should_continue削除**: 並列実行なのでループ不要
+6. **create_graph変更**: `add_conditional_edges` と `set_finish_point` を使用
+
 ```python
-"""
-Step 5: 並列実行
-- Sendによる並列実行
-- パフォーマンス向上
-"""
-
-import json
-import operator
-from typing import Annotated, Literal, Sequence, TypedDict
-
-from langchain_core.utils.function_calling import convert_to_openai_tool
-from langgraph.constants import Send
-from langgraph.graph import END, START, StateGraph
-from langgraph.pregel import Pregel
-from openai import OpenAI
-from openai.types.chat import ChatCompletionMessageParam
-
-from src.configs import Settings
-from src.models import Plan, ReflectionResult, Subtask, ToolResult
-from src.prompts import (
-    CREATE_LAST_ANSWER_SYSTEM_PROMPT,
-    CREATE_LAST_ANSWER_USER_PROMPT,
-    PLANNER_SYSTEM_PROMPT,
-    PLANNER_USER_PROMPT,
-    SUBTASK_SYSTEM_PROMPT,
-    SUBTASK_REFLECTION_USER_PROMPT,
-    SUBTASK_RETRY_USER_PROMPT,
-)
-from src.tools.search_xyz_manual import search_xyz_manual
-from src.tools.search_xyz_qa import search_xyz_qa
+# === インポート追加 ===
+from langgraph.constants import Send  # 追加
 
 
-MAX_CHALLENGE_COUNT = 3
-
-# === ツールの準備 ===
-TOOLS = [search_xyz_manual, search_xyz_qa]
-TOOL_MAP = {tool.name: tool for tool in TOOLS}
-
-
-# === 状態の定義 ===
-class AgentState(TypedDict):
-    """メイングラフの状態"""
-    question: str
-    plan: list[str]
-    current_step: int  # 並列実行では各Sendで個別に設定
-    subtask_results: Annotated[Sequence[Subtask], operator.add]
-    answer: str
-
-
-class SubGraphState(TypedDict):
-    """サブグラフの状態"""
-    question: str
-    plan: list[str]
-    subtask: str
-    is_completed: bool
-    messages: list[ChatCompletionMessageParam]
-    challenge_count: int
-    tool_results: Annotated[Sequence[ToolResult], operator.add]
-    subtask_answer: str
-
-
-# ==========================================
-# サブグラフのノード定義（Step 4と同じ）
-# ==========================================
-
-def select_tools(state: SubGraphState) -> dict:
-    """ツールを選択するノード"""
-
-    settings = Settings()
-    client = OpenAI(api_key=settings.openai_api_key)
-    openai_tools = [convert_to_openai_tool(tool) for tool in TOOLS]
-
-    if state["challenge_count"] == 0:
-        user_prompt = f"サブタスク: {state['subtask']}\n\n適切なツールを選択して実行してください。"
-        messages: list[ChatCompletionMessageParam] = [
-            {"role": "system", "content": SUBTASK_SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ]
-    else:
-        messages = list(state["messages"])
-        messages.append({"role": "user", "content": SUBTASK_RETRY_USER_PROMPT})
-
-    response = client.chat.completions.create(
-        model=settings.openai_model,
-        messages=messages,
-        tools=openai_tools,
-        temperature=0,
-    )
-
-    if response.choices[0].message.tool_calls:
-        ai_message: ChatCompletionMessageParam = {
-            "role": "assistant",
-            "tool_calls": [tc.model_dump() for tc in response.choices[0].message.tool_calls],
-        }
-        messages.append(ai_message)
-
-    return {"messages": messages}
-
-
-def execute_tools(state: SubGraphState) -> dict:
-    """ツールを実行するノード"""
-
-    messages = list(state["messages"])
-    last_message = messages[-1]
-
-    tool_calls = last_message.get("tool_calls", [])
-    if not tool_calls:
-        return {"messages": messages, "tool_results": []}
-
-    tool_results = []
-
-    for tc in tool_calls:
-        tool_name = tc["function"]["name"]
-        tool_args = tc["function"]["arguments"]
-
-        print(f"    [Tool] {tool_name}: {tool_args}")
-
-        tool_fn = TOOL_MAP[tool_name]
-        result = tool_fn.invoke(tool_args)
-
-        tool_results.append(ToolResult(
-            tool_name=tool_name,
-            args=tool_args,
-            results=result
-        ))
-
-        tool_message: ChatCompletionMessageParam = {
-            "role": "tool",
-            "content": json.dumps(result, ensure_ascii=False),
-            "tool_call_id": tc["id"]
-        }
-        messages.append(tool_message)
-
-    return {"messages": messages, "tool_results": tool_results}
-
-
-def create_subtask_answer(state: SubGraphState) -> dict:
-    """サブタスク回答を作成するノード"""
-
-    settings = Settings()
-    client = OpenAI(api_key=settings.openai_api_key)
-
-    response = client.chat.completions.create(
-        model=settings.openai_model,
-        messages=state["messages"],
-        temperature=0,
-    )
-
-    subtask_answer = response.choices[0].message.content or ""
-
-    messages = list(state["messages"])
-    messages.append({"role": "assistant", "content": subtask_answer})
-
-    return {"messages": messages, "subtask_answer": subtask_answer}
-
-
-def reflect_subtask(state: SubGraphState) -> dict:
-    """サブタスク回答を内省するノード"""
-
-    settings = Settings()
-    client = OpenAI(api_key=settings.openai_api_key)
-
-    messages = list(state["messages"])
-    messages.append({"role": "user", "content": SUBTASK_REFLECTION_USER_PROMPT})
-
-    response = client.beta.chat.completions.parse(
-        model=settings.openai_model,
-        messages=messages,
-        response_format=ReflectionResult,
-        temperature=0,
-    )
-
-    reflection = response.choices[0].message.parsed
-    if reflection is None:
-        raise ValueError("Reflection result is None")
-
-    messages.append({
-        "role": "assistant",
-        "content": reflection.model_dump_json()
-    })
-
-    update: dict = {
-        "messages": messages,
-        "challenge_count": state["challenge_count"] + 1,
-        "is_completed": reflection.is_completed,
-    }
-
-    if update["challenge_count"] >= MAX_CHALLENGE_COUNT and not reflection.is_completed:
-        update["subtask_answer"] = f"{state['subtask']}の回答が見つかりませんでした。"
-
-    if reflection.is_completed:
-        print(f"    ✓ 評価OK")
-    else:
-        print(f"    ✗ 評価NG: {reflection.advice}")
-
-    return update
-
-
-def should_continue_subgraph(state: SubGraphState) -> Literal["end", "continue"]:
-    """サブグラフの継続判定"""
-    if state["is_completed"] or state["challenge_count"] >= MAX_CHALLENGE_COUNT:
-        return "end"
-    else:
-        return "continue"
-
-
-def create_subgraph() -> Pregel:
-    """サブグラフを作成する"""
-    workflow = StateGraph(SubGraphState)
-
-    workflow.add_node("select_tools", select_tools)
-    workflow.add_node("execute_tools", execute_tools)
-    workflow.add_node("create_subtask_answer", create_subtask_answer)
-    workflow.add_node("reflect_subtask", reflect_subtask)
-
-    workflow.add_edge(START, "select_tools")
-    workflow.add_edge("select_tools", "execute_tools")
-    workflow.add_edge("execute_tools", "create_subtask_answer")
-    workflow.add_edge("create_subtask_answer", "reflect_subtask")
-
-    workflow.add_conditional_edges(
-        "reflect_subtask",
-        should_continue_subgraph,
-        {"continue": "select_tools", "end": END}
-    )
-
-    return workflow.compile()
-
-
-# ==========================================
-# メイングラフのノード定義
-# ==========================================
-
+# === create_plan: current_stepを返さない ===
 def create_plan(state: AgentState) -> dict:
     """計画を作成するノード"""
+    # ...省略...
 
-    print("[Node] create_plan")
-
-    settings = Settings()
-    client = OpenAI(api_key=settings.openai_api_key)
-
-    messages = [
-        {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
-        {"role": "user", "content": PLANNER_USER_PROMPT.format(question=state["question"])},
-    ]
-
-    response = client.beta.chat.completions.parse(
-        model=settings.openai_model,
-        messages=messages,
-        response_format=Plan,
-        temperature=0,
-    )
-
-    plan = response.choices[0].message.parsed
-    if plan is None:
-        raise ValueError("Plan is None")
-
-    print(f"  計画: {plan.subtasks}")
-
-    return {"plan": plan.subtasks}
+    return {"plan": plan.subtasks}  # current_step: 0 を削除
 
 
+# === 新規追加: route_subtasks ===
 def route_subtasks(state: AgentState) -> list[Send]:
     """サブタスクを並列実行するためのルーティング"""
 
@@ -2213,11 +1707,12 @@ def route_subtasks(state: AgentState) -> list[Send]:
     ]
 
 
+# === execute_subtasks: current_step更新を削除 ===
 def execute_subtasks(state: AgentState) -> dict:
     """サブグラフを実行するノード"""
 
     subtask = state["plan"][state["current_step"]]
-    print(f"[Node] execute_subtask: {subtask}")
+    print(f"[Node] execute_subtask: {subtask}")  # 番号表示を削除
 
     subgraph = create_subgraph()
 
@@ -2240,41 +1735,15 @@ def execute_subtasks(state: AgentState) -> dict:
         challenge_count=result["challenge_count"],
     )
 
-    # operator.addで自動マージされる
+    # current_stepの更新を削除（並列実行では不要）
     return {"subtask_results": [subtask_result]}
 
 
-def create_answer(state: AgentState) -> dict:
-    """最終回答を作成するノード"""
-
-    print("[Node] create_answer")
-
-    settings = Settings()
-    client = OpenAI(api_key=settings.openai_api_key)
-
-    subtask_results_str = "\n\n".join([
-        f"【{r.task_name}】\n{r.subtask_answer}"
-        for r in state["subtask_results"]
-    ])
-
-    messages = [
-        {"role": "system", "content": CREATE_LAST_ANSWER_SYSTEM_PROMPT},
-        {"role": "user", "content": CREATE_LAST_ANSWER_USER_PROMPT.format(
-            question=state["question"],
-            subtask_results=subtask_results_str,
-        )},
-    ]
-
-    response = client.chat.completions.create(
-        model=settings.openai_model,
-        messages=messages,
-        temperature=0,
-    )
-
-    return {"answer": response.choices[0].message.content}
+# === should_continue関数を削除 ===
+# 並列実行ではメイングラフでのループが不要なため
 
 
-# === グラフの構築 ===
+# === create_graph: 並列実行対応に変更 ===
 def create_graph() -> Pregel:
     """メイングラフを作成する"""
     workflow = StateGraph(AgentState)
@@ -2285,7 +1754,7 @@ def create_graph() -> Pregel:
 
     workflow.add_edge(START, "create_plan")
 
-    # 条件分岐でSendを返すと並列実行される
+    # 変更: 条件分岐でSendを返すと並列実行される
     workflow.add_conditional_edges(
         "create_plan",
         route_subtasks,
@@ -2293,42 +1762,33 @@ def create_graph() -> Pregel:
 
     workflow.add_edge("execute_subtasks", "create_answer")
 
+    # 変更: set_finish_pointを使用
     workflow.set_finish_point("create_answer")
 
     return workflow.compile()
+```
 
+**グラフ構造の変化:**
 
-# === 実行 ===
-if __name__ == "__main__":
-    app = create_graph()
+```
+Step 4（直列実行）:
+[create_plan] → [execute_subtasks] ←──┐
+                      ↓              │
+               {should_continue}     │
+                      ├─ continue ───┘
+                      ↓
+                   finish
+                      ↓
+              [create_answer]
 
-    question = """お世話になっております。
-以下の点についてご教示いただければと存じます。
-
-1. 特定のプロジェクトに対してのみ通知を制限する方法について
-
-2. パスワードに利用可能な文字の制限について
-
-よろしくお願いいたします。"""
-
-    result = app.invoke({"question": question})
-
-    print()
-    print("=" * 50)
-    print("【質問】")
-    print(result["question"])
-    print()
-    print("【計画】")
-    for i, task in enumerate(result["plan"], 1):
-        print(f"  {i}. {task}")
-    print()
-    print("【サブタスク結果】")
-    for r in result["subtask_results"]:
-        status = "✓" if r.is_completed else "✗"
-        print(f"  {status} {r.task_name} (試行: {r.challenge_count}回)")
-    print()
-    print("【最終回答】")
-    print(result["answer"])
+Step 5（並列実行）:
+[create_plan]
+      ↓
+{route_subtasks} ─→ Send("execute_subtasks", step=0)
+                 ─→ Send("execute_subtasks", step=1)
+                 ─→ Send("execute_subtasks", step=2)
+                          ↓ (並列実行後にマージ)
+                   [create_answer]
 ```
 
 ---
