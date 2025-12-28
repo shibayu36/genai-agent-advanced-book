@@ -16,12 +16,14 @@ from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
 
 from src.configs import Settings
-from src.models import Plan, Subtask, ToolResult
+from src.models import Plan, ReflectionResult, Subtask, ToolResult
 from src.prompts import (
     CREATE_LAST_ANSWER_SYSTEM_PROMPT,
     CREATE_LAST_ANSWER_USER_PROMPT,
     PLANNER_SYSTEM_PROMPT,
     PLANNER_USER_PROMPT,
+    SUBTASK_REFLECTION_USER_PROMPT,
+    SUBTASK_RETRY_USER_PROMPT,
     SUBTASK_SYSTEM_PROMPT,
 )
 from src.tools.search_xyz_manual import search_xyz_manual
@@ -48,6 +50,8 @@ class SubGraphState(TypedDict):
     question: str
     plan: list[str]
     subtask: str
+    challenge_count: int
+    is_completed: bool
     messages: list[ChatCompletionMessageParam]
     tool_results: Annotated[Sequence[ToolResult], operator.add]
     subtask_answer: str
@@ -56,6 +60,9 @@ class SubGraphState(TypedDict):
 # ==========================================
 # サブグラフのノード定義
 # ==========================================
+
+# SubGraph内の最大試行回数
+MAX_CHALLENGE_COUNT = 3
 
 
 def select_tools(state: SubGraphState) -> dict:
@@ -69,11 +76,17 @@ def select_tools(state: SubGraphState) -> dict:
     # LangChainツールをOpenAI形式に変換
     openai_tools = [convert_to_openai_tool(tool) for tool in TOOLS]
 
-    user_prompt = f"サブタスク: {state['subtask']}\n\n適切なツールを選択して実行してください。"
-    messages = [
-        {"role": "system", "content": SUBTASK_SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ]
+    # 初回かリトライかでプロンプトを切り替え
+    if state["challenge_count"] == 0:
+        user_prompt = f"サブタスク: {state['subtask']}\n\n適切なツールを選択して実行してください。"
+        messages: list[ChatCompletionMessageParam] = [
+            {"role": "system", "content": SUBTASK_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+    else:
+        # リトライ時は過去の対話履歴を使用
+        messages = list(state["messages"])
+        messages.append({"role": "user", "content": SUBTASK_RETRY_USER_PROMPT})
 
     response = client.chat.completions.create(
         model=settings.openai_model,
@@ -143,7 +156,56 @@ def create_subtask_answer(state: SubGraphState) -> dict:
 
     subtask_answer = response.choices[0].message.content or ""
 
-    return {"subtask_answer": subtask_answer}
+    print(f"    回答: {subtask_answer}")
+
+    messages = list(state["messages"])
+    messages.append({"role": "assistant", "content": subtask_answer})
+
+    return {"messages": messages, "subtask_answer": subtask_answer}
+
+
+def reflect_subtask(state: SubGraphState) -> dict:
+    """サブタスクを評価するノード"""
+
+    print("  [SubGraph] reflect_subtask")
+
+    settings = Settings()
+    client = OpenAI(api_key=settings.openai_api_key)
+
+    messages = list(state["messages"])
+    messages.append({"role": "user", "content": SUBTASK_REFLECTION_USER_PROMPT})
+
+    # Structured Outputを使って評価結果を生成
+    response = client.beta.chat.completions.parse(
+        model=settings.openai_model,
+        messages=messages,
+        response_format=ReflectionResult,
+        temperature=0,
+    )
+
+    reflection = response.choices[0].message.parsed
+    if reflection is None:
+        raise ValueError("Reflection result is None")
+
+    messages.append({"role": "assistant", "content": reflection.model_dump_json()})
+
+    print(f"    評価結果: {'OK' if reflection.is_completed else 'NG'}")
+    print(f"    アドバイス: {reflection.advice}")
+
+    update = {
+        "messages": messages,
+        "challenge_count": state["challenge_count"] + 1,
+        "is_completed": reflection.is_completed,
+    }
+    return update
+
+
+def should_continue_subgraph(state: SubGraphState) -> Literal["end", "continue"]:
+    """サブグラフの継続判定"""
+    if state["is_completed"] or state["challenge_count"] >= MAX_CHALLENGE_COUNT:
+        return "end"
+    else:
+        return "continue"
 
 
 def create_subgraph() -> Pregel:
@@ -153,11 +215,17 @@ def create_subgraph() -> Pregel:
     workflow.add_node("select_tools", select_tools)
     workflow.add_node("execute_tools", execute_tools)
     workflow.add_node("create_subtask_answer", create_subtask_answer)
+    workflow.add_node("reflect_subtask", reflect_subtask)
 
     workflow.add_edge(START, "select_tools")
     workflow.add_edge("select_tools", "execute_tools")
     workflow.add_edge("execute_tools", "create_subtask_answer")
-    workflow.add_edge("create_subtask_answer", END)
+    workflow.add_edge("create_subtask_answer", "reflect_subtask")
+    workflow.add_conditional_edges(
+        "reflect_subtask",
+        should_continue_subgraph,
+        {"continue": "select_tools", "end": END},
+    )
 
     return workflow.compile()
 
@@ -209,6 +277,8 @@ def execute_subtasks(state: AgentState) -> dict:
             "question": state["question"],
             "plan": state["plan"],
             "subtask": subtask,
+            "challenge_count": 0,
+            "is_completed": False,
             "messages": [],
             "tool_results": [],
             "subtask_answer": "",
@@ -219,6 +289,8 @@ def execute_subtasks(state: AgentState) -> dict:
         task_name=subtask,
         tool_results=list(result["tool_results"]),
         subtask_answer=result["subtask_answer"],
+        is_completed=result["is_completed"],
+        challenge_count=result["challenge_count"],
     )
 
     # operator.addで自動マージされる
@@ -344,6 +416,10 @@ if __name__ == "__main__":
 3. 大量のデータでレポートを作成するとフリーズすることがあります。効率的な作成方法はありますか？
 
 よろしくお願いします。""",
+        # Q5: 曖昧なキーワード（セキュリティ→二段階認証、スマホ→認証アプリへの再検索を期待）
+        "セキュリティ的なやつを設定したいんですけど、スマホのアプリを使う方法ってありますか？",
+        # Q6: Q&Aに回答がない質問（パスワード文字制限の詳細は未登録）
+        "パスワードって何文字まで使えますか？あと記号は使えますか？",
     ]
 
     # 引数で質問番号を指定(optional)。指定なしなら全ての質問を実行
@@ -368,6 +444,9 @@ if __name__ == "__main__":
         print("【使用したツールと実行結果】")
         for subtask in result.get("subtask_results", []):
             print(f"  サブタスク: {subtask.task_name}")
+            print(f"    試行回数: {subtask.challenge_count}")
+            print(f"    評価結果: {'OK' if subtask.is_completed else 'NG'}")
+            print(f"    回答: {subtask.subtask_answer}")
             for tr in subtask.tool_results:
                 print(f"    - {tr.tool_name}({tr.args})")
                 print(f"      結果: {json.dumps(tr.results, ensure_ascii=False, indent=8)}")
