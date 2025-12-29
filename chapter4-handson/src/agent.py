@@ -10,6 +10,7 @@ import sys
 from typing import Annotated, Literal, Sequence, TypedDict
 
 from langchain_core.utils.function_calling import convert_to_openai_tool
+from langgraph.constants import Send
 from langgraph.graph import END, START, StateGraph
 from langgraph.pregel import Pregel
 from openai import OpenAI
@@ -265,6 +266,25 @@ def create_plan(state: AgentState) -> dict:
     return {"plan": plan.subtasks, "current_step": 0}
 
 
+def route_subtasks(state: AgentState) -> list[Send]:
+    """サブタスクを並列実行するためのルーティング"""
+
+    print(f"[Route] {len(state['plan'])}個のサブタスクを並列実行")
+
+    # 各サブタスクに対してSendを生成
+    return [
+        Send(
+            "execute_subtasks",
+            {
+                "question": state["question"],
+                "plan": state["plan"],
+                "current_step": idx,
+            },
+        )
+        for idx, _ in enumerate(state["plan"])
+    ]
+
+
 def execute_subtasks(state: AgentState) -> dict:
     """サブタスクを実行するノード"""
 
@@ -294,15 +314,7 @@ def execute_subtasks(state: AgentState) -> dict:
     )
 
     # operator.addで自動マージされる
-    return {"subtask_results": [subtask_result], "current_step": state["current_step"] + 1}
-
-
-def should_continue(state: AgentState) -> Literal["continue", "finish"]:
-    """全てのサブタスクが完了したかチェック"""
-    if state["current_step"] < len(state["plan"]):
-        return "continue"
-    else:
-        return "finish"
+    return {"subtask_results": [subtask_result]}
 
 
 def create_answer(state: AgentState) -> dict:
@@ -347,13 +359,12 @@ def create_graph() -> Pregel:
     workflow.add_node("create_answer", create_answer)
 
     workflow.add_edge(START, "create_plan")
-    workflow.add_edge("create_plan", "execute_subtasks")
-
-    # 条件分岐: サブタスクが残っていれば続行、なければ回答作成へ
     workflow.add_conditional_edges(
-        "execute_subtasks", should_continue, {"continue": "execute_subtasks", "finish": "create_answer"}
+        "create_plan",
+        route_subtasks,
     )
 
+    workflow.add_edge("execute_subtasks", "create_answer")
     workflow.add_edge("create_answer", END)
 
     return workflow.compile()
