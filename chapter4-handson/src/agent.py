@@ -9,6 +9,7 @@ import operator
 import sys
 from typing import Annotated, Literal, Sequence, TypedDict
 
+from dotenv import load_dotenv
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.constants import Send
 from langgraph.graph import END, START, StateGraph
@@ -29,6 +30,10 @@ from src.prompts import (
 )
 from src.tools.search_xyz_manual import search_xyz_manual
 from src.tools.search_xyz_qa import search_xyz_qa
+
+# .envファイルをos.environに読み込む
+load_dotenv()
+
 
 # === ツールリスト ===
 TOOLS = [search_xyz_manual, search_xyz_qa]
